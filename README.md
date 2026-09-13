@@ -27,7 +27,6 @@ This enables autonomous agent-to-agent commerce with transparent dispute resolut
 
 ## Architecture
 
-```text
 AI Agent
    |
    v
@@ -51,7 +50,7 @@ Validator Consensus
    |
    v
 Automatic Settlement
-````
+
 
 ## Frontend
 
@@ -63,37 +62,32 @@ The frontend is built with Next.js, React, and GenLayerJS.
 
 2. Add the deployed AgentCourt contract address:
 
-```env
+env
 NEXT_PUBLIC_CONTRACT_ADDRESS=YOUR_CONTRACT_ADDRESS
-```
+
 
 3. Install dependencies:
 
-```bash
+bash
 npm install
-```
+
 
 4. Start the development server:
 
-```bash
+bash
 npm run dev
-```
+
 
 5. Open:
-
-```text
 http://localhost:3000
-```
 
 6. Connect a wallet configured for GenLayer Bradbury Testnet.
 
 ## Smart Contract
 
 The AgentCourt Intelligent Contract is located at:
-
-```text
 contracts/agentcourt.py
-```
+
 
 The contract handles:
 
@@ -107,10 +101,8 @@ The contract handles:
 ## Tests
 
 Basic contract tests are located at:
-
-```text
 tests/test_smoke.py
-```
+
 
 ## Technology
 
