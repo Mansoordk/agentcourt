@@ -1,5 +1,8 @@
-# { "Depends": "py-genlayer:9b8kjyda2ycxyq4ea6g4yfpnydxhd52gqba5rb8dw7krkh5mn9p0" }
-from genlayer import *
+# v0.3.0
+# { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
+
+import genlayer as gl
+from genlayer.types import *
 import json
 
 
@@ -12,15 +15,16 @@ class Recipient:
         pass
 
 
-class AgentCourt(gl.Contract):
+class AgentCourt(gl.contract.Contract):
     next_job_id: u256
-    buyers: TreeMap[u256, Address]
-    sellers: TreeMap[u256, Address]
-    amounts: TreeMap[u256, u256]
-    specs: TreeMap[u256, str]
-    submissions: TreeMap[u256, str]
-    statuses: TreeMap[u256, str]
-    verdicts: TreeMap[u256, str]
+
+    buyers: gl.storage.TreeMap[u256, Address]
+    sellers: gl.storage.TreeMap[u256, Address]
+    amounts: gl.storage.TreeMap[u256, u256]
+    specs: gl.storage.TreeMap[u256, str]
+    submissions: gl.storage.TreeMap[u256, str]
+    statuses: gl.storage.TreeMap[u256, str]
+    verdicts: gl.storage.TreeMap[u256, str]
 
     def __init__(self):
         self.next_job_id = u256(1)
@@ -46,7 +50,7 @@ class AgentCourt(gl.Contract):
         return job_id
 
     @gl.public.write
-    def submit(self, job_id: u256, result: str):
+    def submit(self, job_id: u256, result: str) -> None:
         if self.statuses[job_id] != "OPEN":
             raise gl.vm.UserError("Job is not open")
 
@@ -127,7 +131,7 @@ Do not return any field other than "verdict".
 
         verdict = gl.eq_principle.prompt_comparative(
             evaluate,
-            principle="""
+            """
 The validators must agree on the final verdict.
 
 The verdict must be exactly one of:
@@ -164,12 +168,8 @@ submission.
         elif verdict == "PARTIAL":
             payout = amount // u256(2)
 
-        elif verdict == "FAIL":
-            payout = u256(0)
-
         refund = amount - payout
 
-        # Pay seller
         if payout > u256(0):
             Recipient(
                 self.sellers[job_id]
@@ -177,7 +177,6 @@ submission.
                 value=payout
             )
 
-        # Refund buyer
         if refund > u256(0):
             Recipient(
                 self.buyers[job_id]
@@ -188,7 +187,7 @@ submission.
         return verdict
 
     @gl.public.view
-    def get_job(self, job_id: u256) -> TreeMap[str, str]:
+    def get_job(self, job_id: u256) -> dict[str, str]:
         return {
             "buyer": str(self.buyers[job_id]),
             "seller": str(self.sellers[job_id]),
