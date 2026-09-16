@@ -1,1 +1,1 @@
-{"name":"agentcourt-frontend","private":true,"version":"0.1.0","scripts":{"dev":"next dev","build":"next build","start":"next start"},"dependencies":{"genlayer-js":"latest","next":"latest","react":"latest","react-dom":"latest"}}
+{"name":"agentcourt-frontend","private":true,"version":"0.1.0","scripts":{"dev":"next dev","build":"next build","start":"next start"},"dependencies":{"@genlayer/transaction-kit":"^0.1.0-rc.2","@genlayer/transaction-kit-react":"^0.1.0-rc.2","genlayer-js":"2.0.0-rc.1","next":"latest","react":"latest","react-dom":"latest"}}

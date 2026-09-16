@@ -1,12 +1,52 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { createClient } from 'genlayer-js';
-import { testnetBradbury } from 'genlayer-js/chains';
-import { TransactionHashVariant } from 'genlayer-js/types';
+import {
+  createClient,
+  isSuccessful,
+} from 'genlayer-js';
+import {
+  TransactionHashVariant,
+} from 'genlayer-js/types';
 
 const CONTRACT =
   process.env.NEXT_PUBLIC_CONTRACT_ADDRESS?.trim() || '';
+
+const studioNext = {
+  id: 61997,
+  name: 'GenLayer Studio Devnet',
+  isStudio: true,
+
+  rpcUrls: {
+    default: {
+      http: ['https://studio-dev.genlayer.com/api'],
+    },
+  },
+
+  nativeCurrency: {
+    name: 'GEN Token',
+    symbol: 'GEN',
+    decimals: 18,
+  },
+
+  testnet: true,
+
+  consensusMainContract: {
+    address: '0xb7278A61aa25c888815aFC32Ad3cC52fF24fE575',
+  },
+
+  consensusDataContract: {
+    address: '0x88B0F18613Db92Bf970FfE264E02496e20a74D16',
+  },
+
+  stakingContract: null,
+  feeManagerContract: null,
+  roundsStorageContract: null,
+  appealsContract: null,
+
+  defaultNumberOfInitialValidators: 5,
+  defaultConsensusMaxRotations: 3,
+};
 
 const SPEC = `Produce a list of 5 Nigerian technology companies.
 For every company provide:
@@ -38,21 +78,191 @@ Description: A financial technology company providing payment and banking infras
 const short = (x) =>
   x ? `${x.slice(0, 6)}…${x.slice(-4)}` : 'Not connected';
 
+/*
+ * Convert on-chain wei into a human-readable GEN amount.
+ *
+ * Example:
+ * 1000000000000000000 -> 1 GEN
+ */
+function formatGen(wei) {
+  if (
+    wei === undefined ||
+    wei === null ||
+    wei === ''
+  ) {
+    return '0 GEN';
+  }
+
+  try {
+    const value = BigInt(wei);
+    const base = 1000000000000000000n;
+
+    const whole = value / base;
+    const remainder = value % base;
+
+    if (remainder === 0n) {
+      return `${whole.toString()} GEN`;
+    }
+
+    const decimals = remainder
+      .toString()
+      .padStart(18, '0')
+      .replace(/0+$/, '');
+
+    return `${whole.toString()}.${decimals} GEN`;
+  } catch {
+    return `${String(wei)} wei`;
+  }
+}
+
+/*
+ * The normal waitForTransactionReceipt() helper has been observed
+ * to time out even when Studio Next already reports the transaction
+ * as FINALIZED.
+ *
+ * We therefore poll getTransaction() directly.
+ */
+async function waitForAdjudication(
+  client,
+  txHash,
+  maxAttempts = 60
+) {
+  for (
+    let attempt = 0;
+    attempt < maxAttempts;
+    attempt++
+  ) {
+    try {
+      const tx =
+        await client.getTransaction({
+          hash: txHash,
+        });
+
+      console.log(
+        'ADJUDICATION TX:',
+        tx
+      );
+
+      const statusName =
+        String(
+          tx?.statusName || ''
+        ).toUpperCase();
+
+      const statusNumber =
+        Number(tx?.status);
+
+      const executionResult =
+        String(
+          tx?.txExecutionResultName ||
+          ''
+        ).toUpperCase();
+
+      if (
+        statusName === 'FINALIZED' ||
+        statusNumber === 5
+      ) {
+        if (
+          executionResult &&
+          executionResult !==
+            'FINISHED_WITH_RETURN'
+        ) {
+          throw new Error(
+            `Adjudication execution failed: ${
+              statusName ||
+              statusNumber
+            } / ${
+              executionResult
+            }`
+          );
+        }
+
+        return tx;
+      }
+
+      if (
+        executionResult ===
+        'FINISHED_WITH_ERROR'
+      ) {
+        throw new Error(
+          `Adjudication execution failed: ${
+            statusName ||
+            statusNumber ||
+            'unknown status'
+          } / ${
+            executionResult
+          }`
+        );
+      }
+
+      await new Promise(
+        (resolve) =>
+          setTimeout(
+            resolve,
+            5000
+          )
+      );
+    } catch (error) {
+      if (
+        String(
+          error?.message || ''
+        ).includes(
+          'Adjudication execution failed'
+        )
+      ) {
+        throw error;
+      }
+
+      console.log(
+        'Still waiting for adjudication:',
+        error
+      );
+
+      await new Promise(
+        (resolve) =>
+          setTimeout(
+            resolve,
+            5000
+          )
+      );
+    }
+  }
+
+  throw new Error(
+    `Timed out checking adjudication transaction ${txHash}. The transaction may still be processing. Check Studio Next Explorer.`
+  );
+}
+
 export default function Home() {
   const [wallet, setWallet] = useState('');
-  const [jobId, setJobId] = useState('1');
+  const [jobId, setJobId] = useState('');
   const [spec, setSpec] = useState(SPEC);
   const [result, setResult] = useState(RESULT);
   const [amount, setAmount] = useState('1');
-  const [status, setStatus] = useState(
-    CONTRACT ? 'Ready' : 'Contract address missing'
-  );
-  const [verdict, setVerdict] = useState('');
-  const [job, setJob] = useState(null);
+
+  const [status, setStatus] =
+    useState(
+      CONTRACT
+        ? 'Ready'
+        : 'Contract address missing'
+    );
+
+  const [verdict, setVerdict] =
+    useState('');
+
+  const [job, setJob] =
+    useState(null);
+
+  const [busy, setBusy] =
+    useState(false);
 
   const can = useMemo(
-    () => Boolean(wallet && CONTRACT),
-    [wallet]
+    () =>
+      Boolean(
+        wallet &&
+        CONTRACT &&
+        !busy
+      ),
+    [wallet, CONTRACT, busy]
   );
 
   async function connect() {
@@ -63,26 +273,35 @@ export default function Home() {
         );
       }
 
-      const accounts = await window.ethereum.request({
-        method: 'eth_requestAccounts',
-      });
+      const accounts =
+        await window.ethereum.request({
+          method:
+            'eth_requestAccounts',
+        });
 
       if (!accounts?.length) {
-        throw new Error('No wallet account found.');
+        throw new Error(
+          'No wallet account found.'
+        );
       }
 
-      setWallet(accounts[0]);
+      setWallet(
+        accounts[0]
+      );
 
       if (!CONTRACT) {
         setStatus(
           'Wallet connected — add NEXT_PUBLIC_CONTRACT_ADDRESS'
         );
       } else {
-        setStatus('Wallet connected');
+        setStatus(
+          'Wallet connected'
+        );
       }
     } catch (e) {
       setStatus(
-        e?.message || 'Wallet connection failed'
+        e?.message ||
+        'Wallet connection failed'
       );
     }
   }
@@ -107,43 +326,132 @@ export default function Home() {
     }
 
     return createClient({
-      chain: testnetBradbury,
+      chain: studioNext,
       account: wallet,
-      provider: window.ethereum,
+      provider:
+        window.ethereum,
     });
   }
 
-  // genlayer-js 1.1.8:
-  // Do NOT use estimateTransactionFees() or
-  // estimateTransactionFeesForWrite().
-  async function write(functionName, args, value) {
-    const c = getClient();
+  async function write(
+    functionName,
+    args = [],
+    value = 0n
+  ) {
+    const client =
+      getClient();
 
-    setStatus('Waiting for wallet confirmation…');
-
-    const tx = await c.writeContract({
-      address: CONTRACT,
-      functionName,
-      args,
-      ...(value !== undefined ? { value } : {}),
-    });
+    setBusy(true);
 
     setStatus(
-      'Transaction submitted. Waiting for GenLayer…'
+      `Preparing ${functionName}…`
     );
 
-    return c.waitForFinalization({
-      hash: tx,
-    });
+    try {
+      const call = {
+        address: CONTRACT,
+        functionName,
+        args,
+        value,
+      };
+
+      setStatus(
+        `Estimating GenLayer fee for ${functionName}…`
+      );
+
+      const estimate =
+        await client.estimateTransactionFeesForWrite(
+          call
+        );
+
+      if (!estimate) {
+        throw new Error(
+          'Unable to estimate the GenLayer transaction fee.'
+        );
+      }
+
+      if (
+        estimate.feeValue ===
+        0n
+      ) {
+        throw new Error(
+          'GenLayer returned a zero transaction fee.'
+        );
+      }
+
+      setStatus(
+        `Fee estimated: ${estimate.feeValue.toString()} wei. Confirm in wallet…`
+      );
+
+      const txHash =
+        await client.writeContract({
+          ...call,
+
+          fees: {
+            distribution:
+              estimate.distribution,
+
+            messageAllocations:
+              estimate.messageAllocations,
+
+            feeValue:
+              estimate.feeValue,
+          },
+        });
+
+      setStatus(
+        `Transaction submitted: ${short(
+          txHash
+        )} — waiting for decision…`
+      );
+
+      const receipt =
+        await client.waitForDecision({
+          hash: txHash,
+        });
+
+      if (
+        !isSuccessful(receipt)
+      ) {
+        throw new Error(
+          `Transaction failed: ${
+            receipt?.statusName ||
+            'unknown status'
+          } / ${
+            receipt?.txExecutionResultName ||
+            'unknown execution result'
+          }`
+        );
+      }
+
+      setStatus(
+        `Transaction successful: ${short(
+          txHash
+        )}`
+      );
+
+      return {
+        receipt,
+        txHash,
+      };
+    } finally {
+      setBusy(false);
+    }
   }
 
-  function assertSuccessful(receipt) {
+  function assertSuccessful(
+    receipt
+  ) {
     if (
-      receipt?.txExecutionResultName !==
-      'FINISHED_WITH_RETURN'
+      receipt?.txExecutionResultName &&
+      receipt.txExecutionResultName !==
+        'FINISHED_WITH_RETURN'
     ) {
       throw new Error(
-        `${receipt?.statusName || 'Unknown status'} / ${
+        `${
+          receipt?.statusName ||
+          'Unknown status'
+        } / ${
           receipt?.txExecutionResultName ||
           'Unknown execution result'
         }`
@@ -153,178 +461,625 @@ export default function Home() {
 
   async function createJob() {
     try {
-      if (!window.ethereum) {
-        throw new Error(
-          'Wallet not available.'
-        );
-      }
-
-      if (!CONTRACT) {
-        throw new Error(
-          'Contract address missing. Check .env.local.'
-        );
-      }
-
       if (!wallet) {
         throw new Error(
           'Connect your wallet first.'
         );
       }
 
-      if (!spec.trim()) {
+      if (!CONTRACT) {
         throw new Error(
-          'Specification cannot be empty.'
+          'Contract address is missing.'
         );
       }
 
-      if (!amount || Number(amount) <= 0) {
+      const specification =
+        spec.trim();
+
+      if (!specification) {
         throw new Error(
-          'Escrow must be greater than zero.'
+          'Enter a deal specification.'
         );
       }
 
-      setStatus('Preparing escrow…');
+      const numericAmount =
+        Number(amount);
 
-      const seller = wallet.trim();
+      if (
+        !Number.isFinite(
+          numericAmount
+        ) ||
+        numericAmount <= 0
+      ) {
+        throw new Error(
+          'Escrow amount must be greater than 0.'
+        );
+      }
 
       const value =
-        BigInt(amount) * 10n ** 18n;
+        BigInt(
+          Math.floor(
+            numericAmount *
+              1e18
+          )
+        );
 
-      const receipt = await write(
-        'create_job',
-        [seller, spec],
-        value
+      setBusy(true);
+
+      const client =
+        getClient();
+
+      const call = {
+        address: CONTRACT,
+        functionName:
+          'create_job',
+        args: [
+          wallet,
+          specification,
+        ],
+        value,
+      };
+
+      setStatus(
+        'Estimating GenLayer fee…'
       );
 
-      assertSuccessful(receipt);
+      const estimate =
+        await client.estimateTransactionFeesForWrite(
+          call
+        );
 
-      setStatus('Deal created');
+      if (
+        !estimate ||
+        estimate.feeValue ===
+          0n
+      ) {
+        throw new Error(
+          'Unable to estimate the GenLayer transaction fee.'
+        );
+      }
 
-      await refresh();
+      setStatus(
+        'Confirm the deal in your wallet…'
+      );
+
+      const txHash =
+        await client.writeContract({
+          ...call,
+
+          fees: {
+            distribution:
+              estimate.distribution,
+
+            messageAllocations:
+              estimate.messageAllocations,
+
+            feeValue:
+              estimate.feeValue,
+          },
+        });
+
+      setStatus(
+        `Deal submitted: ${short(
+          txHash
+        )} — waiting for decision…`
+      );
+
+      const receipt =
+        await client.waitForDecision({
+          hash: txHash,
+        });
+
+      if (
+        !isSuccessful(receipt)
+      ) {
+        throw new Error(
+          `Transaction failed: ${
+            receipt?.statusName ||
+            'unknown status'
+          } / ${
+            receipt?.txExecutionResultName ||
+            'unknown execution result'
+          }`
+        );
+      }
+
+      setStatus(
+        'Deal confirmed — finding Job ID…'
+      );
+
+      let newestJobId =
+        null;
+
+      for (
+        let id = 1;
+        id <= 1000;
+        id++
+      ) {
+        try {
+          const data =
+            await client.readContract({
+              address: CONTRACT,
+              functionName:
+                'get_job',
+              args: [
+                BigInt(id),
+              ],
+              transactionHashVariant:
+                TransactionHashVariant.LATEST_NONFINAL,
+            });
+
+          if (
+            data &&
+            data.status &&
+            [
+              'OPEN',
+              'SUBMITTED',
+              'RESOLVED',
+            ].includes(
+              String(
+                data.status
+              ).toUpperCase()
+            )
+          ) {
+            newestJobId =
+              String(id);
+          } else {
+            break;
+          }
+        } catch {
+          break;
+        }
+      }
+
+      if (!newestJobId) {
+        throw new Error(
+          'Deal was created, but the Job ID could not be detected.'
+        );
+      }
+
+      setJobId(
+        newestJobId
+      );
+
+      setVerdict('');
+
+      setStatus(
+        `Deal created successfully — Job #${newestJobId}`
+      );
+
+      await refresh(
+        newestJobId
+      );
+
+      return receipt;
     } catch (e) {
+      console.error(
+        'Create job failed:',
+        e
+      );
+
       setStatus(
         e?.message ||
-          'Failed to create deal'
+        'Failed to create deal.'
       );
+    } finally {
+      setBusy(false);
     }
   }
 
   async function submit() {
     try {
-      if (!jobId || BigInt(jobId) < 1n) {
+      if (
+        !jobId ||
+        BigInt(jobId) <
+          1n
+      ) {
         throw new Error(
-          'Enter a valid job ID.'
+          'Create a deal first.'
         );
       }
 
-      if (!result.trim()) {
+      if (
+        !result.trim()
+      ) {
         throw new Error(
           'Submission cannot be empty.'
         );
       }
 
-      setStatus('Submitting work…');
+      const client =
+        getClient();
 
-      const receipt = await write(
-        'submit',
-        [BigInt(jobId), result]
+      setStatus(
+        `Checking Job #${jobId} status…`
       );
 
-      assertSuccessful(receipt);
+      const currentJob =
+        await client.readContract({
+          address: CONTRACT,
+          functionName:
+            'get_job',
+          args: [
+            BigInt(jobId),
+          ],
+          transactionHashVariant:
+            TransactionHashVariant.LATEST_NONFINAL,
+        });
 
-      setStatus('Work submitted');
+      setJob(
+        currentJob
+      );
 
-      await refresh();
+      const currentStatus =
+        String(
+          currentJob?.status ||
+            ''
+        ).toUpperCase();
+
+      if (
+        currentStatus !==
+        'OPEN'
+      ) {
+        throw new Error(
+          `Job #${jobId} cannot receive a submission. Current status: ${currentStatus}`
+        );
+      }
+
+      setStatus(
+        `Submitting work for Job #${jobId}…`
+      );
+
+      const {
+        receipt,
+      } = await write(
+        'submit',
+        [
+          BigInt(jobId),
+          result,
+        ]
+      );
+
+      assertSuccessful(
+        receipt
+      );
+
+      setStatus(
+        `Work submitted for Job #${jobId}`
+      );
+
+      await refresh(
+        jobId
+      );
     } catch (e) {
+      console.error(
+        'Submit failed:',
+        e
+      );
+
       setStatus(
         e?.message ||
-          'Failed to submit work'
+        'Failed to submit work'
       );
     }
   }
 
   async function adjudicate() {
     try {
-      if (!jobId || BigInt(jobId) < 1n) {
+      if (
+        !jobId ||
+        BigInt(jobId) <
+          1n
+      ) {
         throw new Error(
-          'Enter a valid job ID.'
+          'Create a deal first.'
         );
       }
 
+      const client =
+        getClient();
+
       setStatus(
-        'Validators adjudicating…'
+        `Checking Job #${jobId} status…`
       );
 
-      const receipt = await write(
-        'adjudicate',
-        [BigInt(jobId)]
+      const currentJob =
+        await client.readContract({
+          address: CONTRACT,
+          functionName:
+            'get_job',
+          args: [
+            BigInt(jobId),
+          ],
+          transactionHashVariant:
+            TransactionHashVariant.LATEST_NONFINAL,
+        });
+
+      setJob(
+        currentJob
       );
 
-      assertSuccessful(receipt);
-
-      await refresh();
-
-      setStatus('Case resolved');
-    } catch (e) {
-      setStatus(
-        e?.message ||
-          'Adjudication failed'
+      setVerdict(
+        currentJob?.verdict ||
+          ''
       );
-    }
-  }
 
-  async function refresh() {
-    try {
-      if (!CONTRACT) {
-        throw new Error(
-          'Contract address missing. Check .env.local.'
-        );
-      }
+      const currentStatus =
+        String(
+          currentJob?.status ||
+            ''
+        ).toUpperCase();
 
-      const c = createClient({
-        chain: testnetBradbury,
-      });
-
-      const s = await c.readContract({
-        address: CONTRACT,
-        functionName: 'get_job',
-        args: [BigInt(jobId)],
-        transactionHashVariant:
-          TransactionHashVariant.LATEST_FINAL,
-      });
-
-      setJob(s);
-      setVerdict(s?.verdict || '');
-
-      if (s?.status) {
+      if (
+        currentStatus ===
+        'OPEN'
+      ) {
         setStatus(
-          `Job ${jobId}: ${s.status}`
+          `Job #${jobId} is OPEN — submit the agent's work first.`
+        );
+
+        return;
+      }
+
+      if (
+        currentStatus ===
+        'RESOLVED'
+      ) {
+        setStatus(
+          `Job #${jobId} is already resolved.`
+        );
+
+        return;
+      }
+
+      if (
+        currentStatus !==
+        'SUBMITTED'
+      ) {
+        setStatus(
+          `Job #${jobId} cannot be adjudicated. Current status: ${
+            currentStatus ||
+            'UNKNOWN'
+          }`
+        );
+
+        return;
+      }
+
+      setBusy(true);
+
+      setStatus(
+        `Estimating adjudication fee for Job #${jobId}…`
+      );
+
+      const call = {
+        address: CONTRACT,
+        functionName:
+          'adjudicate',
+        args: [
+          BigInt(jobId),
+        ],
+        value: 0n,
+      };
+
+      const estimate =
+        await client.estimateTransactionFeesForWrite(
+          call
+        );
+
+      console.log(
+        'ADJUDICATE FEE ESTIMATE:',
+        estimate
+      );
+
+      if (
+        !estimate ||
+        estimate.feeValue ===
+          0n
+      ) {
+        throw new Error(
+          'Could not calculate the adjudication fee.'
         );
       }
+
+      if (
+        !estimate.messageAllocations ||
+        estimate.messageAllocations.length ===
+          0
+      ) {
+        throw new Error(
+          'GenLayer did not return the message allocation required for exec_prompt().'
+        );
+      }
+
+      console.log(
+        'ADJUDICATE MESSAGE ALLOCATIONS:',
+        estimate.messageAllocations
+      );
+
+      setStatus(
+        'Confirm adjudication transaction in your wallet…'
+      );
+
+      const txHash =
+        await client.writeContract({
+          ...call,
+
+          fees: {
+            distribution:
+              estimate.distribution,
+
+            messageAllocations:
+              estimate.messageAllocations,
+
+            feeValue:
+              estimate.feeValue,
+          },
+        });
+
+      setStatus(
+        `Adjudication submitted: ${short(
+          txHash
+        )} — waiting for GenLayer consensus…`
+      );
+
+      await waitForAdjudication(
+        client,
+        txHash
+      );
+
+      console.log(
+        'ADJUDICATION FINALIZED:',
+        txHash
+      );
+
+      setStatus(
+        `Adjudication finalized — reading Job #${jobId}…`
+      );
+
+      const finalJob =
+        await client.readContract({
+          address: CONTRACT,
+          functionName:
+            'get_job',
+          args: [
+            BigInt(jobId),
+          ],
+          transactionHashVariant:
+            TransactionHashVariant.LATEST_NONFINAL,
+        });
+
+      console.log(
+        'FINAL JOB STATE:',
+        finalJob
+      );
+
+      setJob(
+        finalJob
+      );
+
+      const finalVerdict =
+        String(
+          finalJob?.verdict ||
+            ''
+        ).toUpperCase();
+
+      setVerdict(
+        finalVerdict
+      );
+
+      if (
+        finalJob?.status !==
+        'RESOLVED'
+      ) {
+        await new Promise(
+          (resolve) =>
+            setTimeout(
+              resolve,
+              2000
+            )
+        );
+
+        await refresh(
+          jobId
+        );
+      }
+
+      setStatus(
+        finalVerdict
+          ? `Job #${jobId} adjudicated successfully — verdict: ${finalVerdict}`
+          : `Job #${jobId} adjudicated successfully — case resolved`
+      );
+
+      return finalJob;
     } catch (e) {
+      console.error(
+        'Adjudication failed:',
+        e
+      );
+
       setStatus(
         e?.message ||
-          'Unable to read contract'
+        'Failed to adjudicate job.'
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refresh(
+    id = jobId
+  ) {
+    if (!id) return;
+
+    try {
+      const client =
+        getClient();
+
+      const data =
+        await client.readContract({
+          address: CONTRACT,
+          functionName:
+            'get_job',
+          args: [
+            BigInt(id),
+          ],
+          transactionHashVariant:
+            TransactionHashVariant.LATEST_NONFINAL,
+        });
+
+      setJob(data);
+
+      setVerdict(
+        data?.verdict ||
+          ''
+      );
+    } catch (error) {
+      console.error(
+        'Refresh failed:',
+        error
       );
     }
   }
+
+  /*
+   * Format the job for display.
+   *
+   * IMPORTANT:
+   * The actual contract value remains untouched.
+   * Only the UI representation changes.
+   */
+  const displayJob =
+    job
+      ? {
+          ...job,
+          amount:
+            formatGen(
+              job.amount
+            ),
+        }
+      : null;
 
   return (
     <main>
       <nav>
         <div className="brand">
-          <span className="mark">A</span>
+          <span className="mark">
+            A
+          </span>
+
           AGENTCOURT
         </div>
 
         <div className="navRight">
           <span className="network">
-            <i /> Bradbury Testnet
+            <i /> Studio Next
           </span>
 
           <button
             className="wallet"
             onClick={connect}
+            disabled={busy}
           >
             {wallet
               ? short(wallet)
@@ -341,12 +1096,15 @@ export default function Home() {
         <h1>
           When agents transact,
           <br />
-          <em>who decides?</em>
+          <em>
+            who decides?
+          </em>
         </h1>
 
         <p>
-          Natural-language agreements. GEN escrow.
-          Evidence. GenLayer validator adjudication.
+          Natural-language agreements.
+          GEN escrow. Evidence.
+          GenLayer validator adjudication.
           Automatic settlement.
         </p>
 
@@ -355,9 +1113,12 @@ export default function Home() {
             className="primary"
             onClick={() =>
               document
-                .getElementById('deal')
+                .getElementById(
+                  'deal'
+                )
                 ?.scrollIntoView({
-                  behavior: 'smooth',
+                  behavior:
+                    'smooth',
                 })
             }
           >
@@ -376,16 +1137,40 @@ export default function Home() {
 
       <section className="stats">
         {[
-          ['01', 'Agreement', 'Natural language'],
-          ['02', 'Escrow', 'GEN locked'],
-          ['03', 'Evidence', 'Agent submission'],
-          ['04', 'Adjudication', 'Validator consensus'],
-          ['05', 'Settlement', 'Automatic payout'],
+          [
+            '01',
+            'Agreement',
+            'Natural language',
+          ],
+          [
+            '02',
+            'Escrow',
+            'GEN locked',
+          ],
+          [
+            '03',
+            'Evidence',
+            'Agent submission',
+          ],
+          [
+            '04',
+            'Adjudication',
+            'Validator consensus',
+          ],
+          [
+            '05',
+            'Settlement',
+            'Automatic payout',
+          ],
         ].map((x) => (
           <div key={x[0]}>
             <b>{x[0]}</b>
-            <span>{x[1]}</span>
-            <small>{x[2]}</small>
+            <span>
+              {x[1]}
+            </span>
+            <small>
+              {x[2]}
+            </small>
           </div>
         ))}
       </section>
@@ -414,13 +1199,17 @@ export default function Home() {
           <div
             className="status"
             style={{
-              marginBottom: '20px',
-              borderColor: '#b33',
+              marginBottom:
+                '20px',
+              borderColor:
+                '#b33',
             }}
           >
-            CONTRACT NOT CONFIGURED — add
-            NEXT_PUBLIC_CONTRACT_ADDRESS to
-            .env.local, then restart Next.js.
+            CONTRACT NOT CONFIGURED —
+            add
+            NEXT_PUBLIC_CONTRACT_ADDRESS
+            to .env.local, then
+            restart Next.js.
           </div>
         )}
 
@@ -438,7 +1227,9 @@ export default function Home() {
             <input
               value={wallet}
               onChange={(e) =>
-                setWallet(e.target.value)
+                setWallet(
+                  e.target.value
+                )
               }
               placeholder="0x…"
             />
@@ -450,7 +1241,9 @@ export default function Home() {
             <textarea
               value={spec}
               onChange={(e) =>
-                setSpec(e.target.value)
+                setSpec(
+                  e.target.value
+                )
               }
               rows="9"
             />
@@ -467,7 +1260,9 @@ export default function Home() {
                   step="1"
                   value={amount}
                   onChange={(e) =>
-                    setAmount(e.target.value)
+                    setAmount(
+                      e.target.value
+                    )
                   }
                 />
               </div>
@@ -475,9 +1270,13 @@ export default function Home() {
               <button
                 className="dark"
                 disabled={!can}
-                onClick={createJob}
+                onClick={
+                  createJob
+                }
               >
-                Lock GEN →
+                {busy
+                  ? 'Processing…'
+                  : 'Lock GEN →'}
               </button>
             </div>
           </div>
@@ -497,8 +1296,11 @@ export default function Home() {
               min="1"
               value={jobId}
               onChange={(e) =>
-                setJobId(e.target.value)
+                setJobId(
+                  e.target.value
+                )
               }
+              placeholder="Created automatically"
             />
 
             <label>
@@ -508,17 +1310,26 @@ export default function Home() {
             <textarea
               value={result}
               onChange={(e) =>
-                setResult(e.target.value)
+                setResult(
+                  e.target.value
+                )
               }
               rows="15"
             />
 
             <button
               className="dark full"
-              disabled={!can}
-              onClick={submit}
+              disabled={
+                !can ||
+                !jobId
+              }
+              onClick={
+                submit
+              }
             >
-              Submit work →
+              {busy
+                ? 'Processing…'
+                : 'Submit work →'}
             </button>
           </div>
 
@@ -538,6 +1349,42 @@ export default function Home() {
               </small>
             </div>
 
+            {job?.status && (
+              <div
+                style={{
+                  marginTop:
+                    '14px',
+                  marginBottom:
+                    '14px',
+                  fontSize:
+                    '13px',
+                }}
+              >
+                Job status:{' '}
+                <strong>
+                  {job.status}
+                </strong>
+              </div>
+            )}
+
+            {job?.amount && (
+              <div
+                style={{
+                  marginBottom:
+                    '14px',
+                  fontSize:
+                    '13px',
+                }}
+              >
+                Escrow:{' '}
+                <strong>
+                  {formatGen(
+                    job.amount
+                  )}
+                </strong>
+              </div>
+            )}
+
             <div className="steps">
               <div>
                 ● Contract requirements
@@ -550,21 +1397,42 @@ export default function Home() {
               <div>
                 {verdict
                   ? '● Consensus reached'
-                  : '○ Awaiting adjudication'}
+                  : job?.status ===
+                    'SUBMITTED'
+                  ? '● Ready for adjudication'
+                  : '○ Waiting for submitted evidence'}
               </div>
             </div>
 
             <button
               className="primary full"
-              disabled={!can}
-              onClick={adjudicate}
+              disabled={
+                !can ||
+                !jobId ||
+                String(
+                  job?.status ||
+                    ''
+                ).toUpperCase() !==
+                  'SUBMITTED'
+              }
+              onClick={
+                adjudicate
+              }
             >
-              Open case →
+              {busy
+                ? 'Adjudicating…'
+                : 'Open case →'}
             </button>
 
             <button
               className="ghost full"
-              onClick={refresh}
+              onClick={() =>
+                refresh(jobId)
+              }
+              disabled={
+                busy ||
+                !jobId
+              }
             >
               Refresh state
             </button>
@@ -576,9 +1444,11 @@ export default function Home() {
                 </b>
 
                 <small>
-                  {verdict === 'PASS'
+                  {verdict ===
+                  'PASS'
                     ? '100% escrow released to seller'
-                    : verdict === 'PARTIAL'
+                    : verdict ===
+                      'PARTIAL'
                     ? '50% escrow released to seller'
                     : 'Escrow refunded to buyer'}
                 </small>
@@ -587,10 +1457,10 @@ export default function Home() {
           </div>
         </div>
 
-        {job && (
+        {displayJob && (
           <pre className="state">
             {JSON.stringify(
-              job,
+              displayJob,
               null,
               2
             )}
@@ -605,19 +1475,23 @@ export default function Home() {
           </div>
 
           <h2>
-            Autonomous commerce needs a court.
+            Autonomous commerce needs
+            a court.
           </h2>
         </div>
 
         <p>
-          Smart contracts enforce deterministic
-          rules. AgentCourt handles the hard
+          Smart contracts enforce
+          deterministic rules.
+          AgentCourt handles the hard
           question:{' '}
           <strong>
-            did an agent actually satisfy a
-            human-readable obligation?
+            did an agent actually
+            satisfy a human-readable
+            obligation?
           </strong>{' '}
-          GenLayer supplies the adjudication layer.
+          GenLayer supplies the
+          adjudication layer.
         </p>
       </section>
 
